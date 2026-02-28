@@ -1,0 +1,5 @@
+{
+  "name": "SRT Intelligence Scraper",
+  "description": "An application that scrapes rtraintelligence.com for SRT related reports and stores them in a database.",
+  "requestFramePermissions": []
+}
