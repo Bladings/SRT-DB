@@ -154,7 +154,8 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json({ limit: '50mb' }));
+  app.use(express.json({ limit: '500mb' }));
+  app.use(express.urlencoded({ limit: '500mb', extended: true }));
 
   // API Routes
   app.get('/api/reports', (req, res) => {
@@ -216,31 +217,38 @@ async function startServer() {
 
   app.post('/api/restore', (req, res) => {
     try {
-      const reports = req.body;
+      const isArray = Array.isArray(req.body);
+      const reports = isArray ? req.body : req.body.reports;
+      const shouldClear = isArray ? true : req.body.clear;
+
       if (!Array.isArray(reports)) {
         return res.status(400).json({ error: 'Invalid backup file format. Expected an array of reports.' });
       }
 
-      // Clear existing data
-      db.prepare('DELETE FROM reports').run();
+      // Clear existing data if requested
+      if (shouldClear) {
+        db.prepare('DELETE FROM reports').run();
+      }
 
       const insert = db.prepare(`
-        INSERT INTO reports (id, title, url, date, type, summary, content, structured_data, created_at)
+        INSERT OR REPLACE INTO reports (id, title, url, date, type, summary, content, structured_data, created_at)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
 
       const insertMany = db.transaction((items) => {
         for (const item of items) {
+          if (!item.title || !item.url) continue; // Skip invalid rows
+          
           insert.run(
             item.id,
             item.title,
             item.url,
-            item.date,
-            item.type,
-            item.summary,
+            item.date || null,
+            item.type || null,
+            item.summary || null,
             item.content || null,
             item.structured_data || null,
-            item.created_at
+            item.created_at || new Date().toISOString()
           );
         }
       });

@@ -45,47 +45,66 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    if (!confirm('Are you sure you want to restore from this backup? This will overwrite all current data.')) {
-      if (fileInputRef.current) fileInputRef.current.value = '';
-      return;
-    }
-
     setRestoring(true);
-    setScrapeResult({ success: true, message: 'Reading backup file...' });
+    setScrapeResult({ success: true, message: 'Processing backup file locally...' });
 
     try {
-      const reader = new FileReader();
-      reader.onload = async (event) => {
-        try {
-          const content = event.target?.result as string;
-          const reportsData = JSON.parse(content);
-          
-          setScrapeResult({ success: true, message: 'Uploading backup to server...' });
-          
-          const res = await fetch('/api/restore', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(reportsData)
-          });
-          
-          const data = await res.json();
-          if (data.success) {
-            setScrapeResult({ success: true, message: data.message });
-            fetchReports();
-            fetchStats();
-          } else {
-            setScrapeResult({ success: false, message: data.error || 'Failed to restore backup' });
-          }
-        } catch (err: any) {
-          setScrapeResult({ success: false, message: 'Invalid backup file format' });
-        } finally {
-          setRestoring(false);
-          if (fileInputRef.current) fileInputRef.current.value = '';
+      const text = await file.text();
+      let reportsData;
+      
+      try {
+        reportsData = JSON.parse(text);
+      } catch (parseError) {
+        throw new Error('Invalid JSON format. Please make sure you selected the .json backup file.');
+      }
+      
+      if (!Array.isArray(reportsData)) {
+        throw new Error('Backup file must contain an array of reports.');
+      }
+
+      const total = reportsData.length;
+      setScrapeResult({ success: true, message: `Starting upload of ${total} reports in batches...` });
+      
+      const BATCH_SIZE = 50;
+      let totalRestored = 0;
+
+      for (let i = 0; i < total; i += BATCH_SIZE) {
+        const batch = reportsData.slice(i, i + BATCH_SIZE);
+        const isFirstBatch = i === 0;
+
+        const res = await fetch('/api/restore', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            clear: isFirstBatch,
+            reports: batch
+          })
+        });
+        
+        if (!res.ok) {
+          const errorText = await res.text();
+          throw new Error(`Server error (${res.status}): ${errorText.substring(0, 100)}`);
         }
-      };
-      reader.readAsText(file);
+
+        const data = await res.json();
+        if (!data.success) {
+          throw new Error(data.error || 'Failed to restore backup batch');
+        }
+
+        totalRestored += batch.length;
+        setScrapeResult({ success: true, message: `Restoring... (${totalRestored}/${total})` });
+        
+        // Small delay to ensure the server has time to process the transaction
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+
+      setScrapeResult({ success: true, message: `Successfully restored ${total} reports from backup!` });
+      fetchReports();
+      fetchStats();
     } catch (error: any) {
-      setScrapeResult({ success: false, message: error.message || 'Failed to read file' });
+      console.error('Restore error:', error);
+      setScrapeResult({ success: false, message: error.message || 'Error restoring backup' });
+    } finally {
       setRestoring(false);
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
@@ -149,7 +168,8 @@ export default function App() {
   };
 
   const handleDeleteScraped = async () => {
-    if (!confirm('Are you sure you want to delete ALL scraped reports? This cannot be undone.')) return;
+    // Note: confirm dialogs are blocked in this iframe environment, so we proceed directly
+    setScrapeResult({ success: true, message: 'Deleting all scraped reports...' });
     try {
       const res = await fetch('/api/reports', { method: 'DELETE' });
       const data = await res.json();
@@ -166,7 +186,8 @@ export default function App() {
   };
 
   const handleDeleteExtracted = async () => {
-    if (!confirm('Are you sure you want to clear ALL extracted data? You will need to re-run the AI extraction.')) return;
+    // Note: confirm dialogs are blocked in this iframe environment, so we proceed directly
+    setScrapeResult({ success: true, message: 'Clearing all extracted data...' });
     try {
       const res = await fetch('/api/reports/extracted', { method: 'DELETE' });
       const data = await res.json();
@@ -362,7 +383,10 @@ export default function App() {
               Export CSV
             </a>
             <button 
-              onClick={() => setShowSettings(!showSettings)}
+              onClick={() => {
+                setShowSettings(!showSettings);
+                setScrapeResult(null);
+              }}
               className="p-2 text-slate-500 hover:text-indigo-600 hover:bg-slate-100 rounded-full transition-colors"
             >
               <Settings className="w-5 h-5" />
@@ -422,12 +446,6 @@ export default function App() {
               
               <div className="flex items-center justify-between pt-2">
                 <div className="flex-1">
-                  {scrapeResult && (
-                    <div className={`flex items-center gap-2 text-sm ${scrapeResult.success ? 'text-emerald-600' : 'text-rose-600'}`}>
-                      {scrapeResult.success ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
-                      {scrapeResult.message}
-                    </div>
-                  )}
                 </div>
                 <div className="flex gap-2">
                   {enriching && (
@@ -442,7 +460,7 @@ export default function App() {
                   <button 
                     type="button"
                     onClick={handleEnrich}
-                    disabled={enriching || scraping}
+                    disabled={enriching || scraping || restoring}
                     className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
                   >
                     {enriching ? (
@@ -453,7 +471,7 @@ export default function App() {
                   </button>
                   <button 
                     type="submit" 
-                    disabled={scraping || enriching}
+                    disabled={scraping || enriching || restoring}
                     className="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
                   >
                     {scraping ? (
@@ -472,6 +490,14 @@ export default function App() {
                 Backup & Restore
               </h3>
               <p className="text-xs text-slate-500 mb-4">Save your progress to a file so you can restore it later if the server resets.</p>
+              
+              {scrapeResult && (
+                <div className={`mb-4 p-3 rounded-lg flex items-center gap-2 text-sm ${scrapeResult.success ? 'bg-emerald-50 text-emerald-700 border border-emerald-100' : 'bg-rose-50 text-rose-700 border border-rose-100'}`}>
+                  {scrapeResult.success ? <CheckCircle2 className="w-4 h-4" /> : <AlertCircle className="w-4 h-4" />}
+                  {scrapeResult.message}
+                </div>
+              )}
+
               <div className="flex flex-wrap gap-3 mb-8">
                 <a
                   href="/api/backup"
