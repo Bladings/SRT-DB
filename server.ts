@@ -87,7 +87,7 @@ async function scrapeReports(username?: string, password?: string) {
       let page = 1;
       let hasMore = true;
       
-      while (hasMore && page <= 50) { // Limit to 50 pages to prevent infinite loop
+      while (hasMore) { 
         try {
           const url = page === 1 ? cat : `${cat}?jsf=jet-engine:allpublication&pagenum=${page}`;
           const catRes = await axiosInstance.get(url, {
@@ -154,7 +154,7 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: '50mb' }));
 
   // API Routes
   app.get('/api/reports', (req, res) => {
@@ -195,17 +195,68 @@ async function startServer() {
   app.get('/api/stats', (req, res) => {
     try {
       const total = db.prepare('SELECT COUNT(*) as count FROM reports').get() as { count: number };
+      const extracted = db.prepare('SELECT COUNT(*) as count FROM reports WHERE structured_data IS NOT NULL').get() as { count: number };
       const byType = db.prepare('SELECT type, COUNT(*) as count FROM reports GROUP BY type').all();
-      res.json({ total: total.count, byType });
+      res.json({ total: total.count, extractedCount: extracted.count, byType });
     } catch (error) {
       res.status(500).json({ error: 'Failed to fetch stats' });
+    }
+  });
+
+  app.get('/api/backup', (req, res) => {
+    try {
+      const reports = db.prepare('SELECT * FROM reports').all();
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Content-Disposition', 'attachment; filename=srt_database_backup.json');
+      res.send(JSON.stringify(reports));
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.post('/api/restore', (req, res) => {
+    try {
+      const reports = req.body;
+      if (!Array.isArray(reports)) {
+        return res.status(400).json({ error: 'Invalid backup file format. Expected an array of reports.' });
+      }
+
+      // Clear existing data
+      db.prepare('DELETE FROM reports').run();
+
+      const insert = db.prepare(`
+        INSERT INTO reports (id, title, url, date, type, summary, content, structured_data, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `);
+
+      const insertMany = db.transaction((items) => {
+        for (const item of items) {
+          insert.run(
+            item.id,
+            item.title,
+            item.url,
+            item.date,
+            item.type,
+            item.summary,
+            item.content || null,
+            item.structured_data || null,
+            item.created_at
+          );
+        }
+      });
+
+      insertMany(reports);
+      res.json({ success: true, message: `Successfully restored ${reports.length} reports from backup.` });
+    } catch (error: any) {
+      console.error('Restore error:', error);
+      res.status(500).json({ error: error.message });
     }
   });
 
   app.get('/api/reports/unenriched', async (req, res) => {
     try {
       const { username, password } = req.query;
-      const reportsToEnrich = db.prepare('SELECT id, url, type FROM reports WHERE structured_data IS NULL LIMIT 20').all() as any[];
+      const reportsToEnrich = db.prepare('SELECT id, url, type FROM reports WHERE structured_data IS NULL LIMIT 10').all() as any[];
       
       if (reportsToEnrich.length === 0) {
         return res.json({ reports: [] });
@@ -283,6 +334,24 @@ async function startServer() {
 
       updateMany(updates);
       res.json({ success: true, updatedCount });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete('/api/reports', (req, res) => {
+    try {
+      db.prepare('DELETE FROM reports').run();
+      res.json({ success: true, message: 'All scraped data deleted.' });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    }
+  });
+
+  app.delete('/api/reports/extracted', (req, res) => {
+    try {
+      db.prepare('UPDATE reports SET structured_data = NULL').run();
+      res.json({ success: true, message: 'All extracted data cleared.' });
     } catch (error: any) {
       res.status(500).json({ error: error.message });
     }

@@ -1,5 +1,5 @@
-import React, { useState, useEffect } from 'react';
-import { Search, Filter, RefreshCw, Database, FileText, BarChart3, Settings, AlertCircle, CheckCircle2, Download } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Search, Filter, RefreshCw, Database, FileText, BarChart3, Settings, AlertCircle, CheckCircle2, Download, Trash2, XCircle } from 'lucide-react';
 
 interface Report {
   id: number;
@@ -9,28 +9,87 @@ interface Report {
   type: string;
   summary: string;
   created_at: string;
+  structured_data?: string;
 }
 
 interface Stats {
   total: number;
+  extractedCount: number;
   byType: { type: string; count: number }[];
 }
 
 import { GoogleGenAI, Type } from '@google/genai';
+import { ChevronDown, ChevronUp } from 'lucide-react';
 
 export default function App() {
   const [reports, setReports] = useState<Report[]>([]);
-  const [stats, setStats] = useState<Stats>({ total: 0, byType: [] });
+  const [stats, setStats] = useState<Stats>({ total: 0, extractedCount: 0, byType: [] });
   const [loading, setLoading] = useState(true);
   const [scraping, setScraping] = useState(false);
   const [enriching, setEnriching] = useState(false);
+  const [restoring, setRestoring] = useState(false);
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState('All');
+  const [expandedReportId, setExpandedReportId] = useState<number | null>(null);
+  const [selectedModel, setSelectedModel] = useState('gemini-3-flash-preview');
   
   const [showSettings, setShowSettings] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [scrapeResult, setScrapeResult] = useState<{success: boolean, message: string} | null>(null);
+
+  const stopExtractionRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleRestore = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (!confirm('Are you sure you want to restore from this backup? This will overwrite all current data.')) {
+      if (fileInputRef.current) fileInputRef.current.value = '';
+      return;
+    }
+
+    setRestoring(true);
+    setScrapeResult({ success: true, message: 'Reading backup file...' });
+
+    try {
+      const reader = new FileReader();
+      reader.onload = async (event) => {
+        try {
+          const content = event.target?.result as string;
+          const reportsData = JSON.parse(content);
+          
+          setScrapeResult({ success: true, message: 'Uploading backup to server...' });
+          
+          const res = await fetch('/api/restore', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(reportsData)
+          });
+          
+          const data = await res.json();
+          if (data.success) {
+            setScrapeResult({ success: true, message: data.message });
+            fetchReports();
+            fetchStats();
+          } else {
+            setScrapeResult({ success: false, message: data.error || 'Failed to restore backup' });
+          }
+        } catch (err: any) {
+          setScrapeResult({ success: false, message: 'Invalid backup file format' });
+        } finally {
+          setRestoring(false);
+          if (fileInputRef.current) fileInputRef.current.value = '';
+        }
+      };
+      reader.readAsText(file);
+    } catch (error: any) {
+      setScrapeResult({ success: false, message: error.message || 'Failed to read file' });
+      setRestoring(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
 
   const fetchReports = async () => {
     setLoading(true);
@@ -89,122 +148,196 @@ export default function App() {
     }
   };
 
+  const handleDeleteScraped = async () => {
+    if (!confirm('Are you sure you want to delete ALL scraped reports? This cannot be undone.')) return;
+    try {
+      const res = await fetch('/api/reports', { method: 'DELETE' });
+      const data = await res.json();
+      if (data.success) {
+        setScrapeResult({ success: true, message: data.message });
+        fetchReports();
+        fetchStats();
+      } else {
+        setScrapeResult({ success: false, message: data.error || 'Failed to delete data' });
+      }
+    } catch (error: any) {
+      setScrapeResult({ success: false, message: error.message || 'Network error' });
+    }
+  };
+
+  const handleDeleteExtracted = async () => {
+    if (!confirm('Are you sure you want to clear ALL extracted data? You will need to re-run the AI extraction.')) return;
+    try {
+      const res = await fetch('/api/reports/extracted', { method: 'DELETE' });
+      const data = await res.json();
+      if (data.success) {
+        setScrapeResult({ success: true, message: data.message });
+        fetchReports();
+        fetchStats();
+      } else {
+        setScrapeResult({ success: false, message: data.error || 'Failed to clear data' });
+      }
+    } catch (error: any) {
+      setScrapeResult({ success: false, message: error.message || 'Network error' });
+    }
+  };
+
+  const handleStopExtraction = () => {
+    stopExtractionRef.current = true;
+    setScrapeResult({ success: true, message: 'Stopping extraction after current batch...' });
+  };
+
   const handleEnrich = async () => {
     setEnriching(true);
-    setScrapeResult(null);
+    stopExtractionRef.current = false;
+    setScrapeResult({ success: true, message: 'Starting extraction process for all reports...' });
+    
+    let totalProcessed = 0;
+    let hasMore = true;
+
     try {
-      // 1. Fetch unenriched reports from backend
-      const params = new URLSearchParams();
-      if (username) params.append('username', username);
-      if (password) params.append('password', password);
-      
-      const res = await fetch(`/api/reports/unenriched?${params.toString()}`);
-      const data = await res.json();
-      
-      if (!data.reports || data.reports.length === 0) {
-        setScrapeResult({ success: true, message: 'All reports are already enriched.' });
-        setEnriching(false);
-        return;
-      }
-
-      setScrapeResult({ success: true, message: `Extracting data for ${data.reports.length} reports...` });
-
-      // 2. Initialize Gemini API
       const ai = new GoogleGenAI({ apiKey: import.meta.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY });
-      const updates = [];
 
-      // 3. Process each report
-      for (const report of data.reports) {
-        try {
-          let schemaProperties: any = {};
-          if (report.type === 'Deal News' || report.type === 'Pipeline News') {
-            schemaProperties = {
-              MONTH: { type: Type.STRING },
-              YEAR: { type: Type.STRING },
-              "TRANSACTION NAME": { type: Type.STRING },
-              ORIGINATOR: { type: Type.STRING },
-              "TRANCHE TYPE": { type: Type.STRING },
-              CURRENCY: { type: Type.STRING },
-              "TRANCHE AMOUNT (millions)": { type: Type.NUMBER },
-              "ATTACHMENT POINT (%)": { type: Type.NUMBER },
-              "DETACHMENT POINT (%)": { type: Type.NUMBER },
-              PRICING: { type: Type.STRING },
-              "PORTFOLIO SIZE (millions)": { type: Type.NUMBER },
-              "ASSET CLASS": { type: Type.STRING },
-              JURISDICTION: { type: Type.STRING },
-              "PORTFOLIO WAL": { type: Type.STRING },
-              "PORTFOLIO/CAPITAL CALCULATION APPROACH": { type: Type.STRING },
-              "AMORTIZATION STRUCTURE": { type: Type.STRING },
-              "DEAL STRUCTURE": { type: Type.STRING },
-              "BILATERAL/SYNDICATED": { type: Type.STRING },
-              "EXCESS SPREAD": { type: Type.STRING },
-              "NUMBER OF BORROWERS": { type: Type.NUMBER },
-              "CALL DATE": { type: Type.STRING },
-              STS: { type: Type.STRING },
-              INVESTOR: { type: Type.STRING },
-              ARRANGER: { type: Type.STRING },
-            };
-          } else {
-            schemaProperties = {
-              "KEY TAKEAWAYS": { type: Type.ARRAY, items: { type: Type.STRING } },
-              "MAIN TOPIC": { type: Type.STRING },
-              "COMPANIES MENTIONED": { type: Type.ARRAY, items: { type: Type.STRING } },
-            };
-          }
+      while (hasMore) {
+        if (stopExtractionRef.current) {
+          setScrapeResult({ success: true, message: `Extraction stopped by user. Processed ${totalProcessed} reports.` });
+          break;
+        }
 
-          const prompt = `
-          Extract the following information from the article text.
-          If a field is not mentioned, leave it empty or null.
-          
-          Article Text:
-          ${report.content}
-          `;
+        // 1. Fetch unenriched reports from backend
+        const params = new URLSearchParams();
+        if (username) params.append('username', username);
+        if (password) params.append('password', password);
+        
+        const res = await fetch(`/api/reports/unenriched?${params.toString()}`);
+        const data = await res.json();
+        
+        if (!data.reports || data.reports.length === 0) {
+          hasMore = false;
+          break;
+        }
 
-          const aiResponse = await ai.models.generateContent({
-            model: "gemini-3-flash-preview",
-            contents: prompt,
-            config: {
-              responseMimeType: "application/json",
-              responseSchema: {
-                type: Type.OBJECT,
-                properties: schemaProperties
-              }
+        const batchToProcess = data.reports;
+        
+        if (batchToProcess.length === 0) {
+          hasMore = false;
+          break;
+        }
+
+        setScrapeResult({ success: true, message: `Extracting data... (Processed ${totalProcessed} so far, working on next batch of ${batchToProcess.length}. Please keep this tab open.)` });
+
+        const updates = [];
+
+        // 2. Process each report
+        for (const report of batchToProcess) {
+          if (stopExtractionRef.current) break;
+
+          try {
+            let schemaProperties: any = {};
+            if (report.type === 'Deal News' || report.type === 'Pipeline News') {
+              schemaProperties = {
+                MONTH: { type: Type.STRING },
+                YEAR: { type: Type.STRING },
+                "TRANSACTION NAME": { type: Type.STRING },
+                ORIGINATOR: { type: Type.STRING },
+                "TRANCHE TYPE": { type: Type.STRING },
+                CURRENCY: { type: Type.STRING },
+                "TRANCHE AMOUNT (millions)": { type: Type.NUMBER },
+                "ATTACHMENT POINT (%)": { type: Type.NUMBER },
+                "DETACHMENT POINT (%)": { type: Type.NUMBER },
+                PRICING: { type: Type.STRING },
+                "PORTFOLIO SIZE (millions)": { type: Type.NUMBER },
+                "ASSET CLASS": { type: Type.STRING },
+                JURISDICTION: { type: Type.STRING },
+                "PORTFOLIO WAL": { type: Type.STRING },
+                "PORTFOLIO/CAPITAL CALCULATION APPROACH": { type: Type.STRING },
+                "AMORTIZATION STRUCTURE": { type: Type.STRING },
+                "DEAL STRUCTURE": { type: Type.STRING },
+                "BILATERAL/SYNDICATED": { type: Type.STRING },
+                "EXCESS SPREAD": { type: Type.STRING },
+                "NUMBER OF BORROWERS": { type: Type.NUMBER },
+                "CALL DATE": { type: Type.STRING },
+                STS: { type: Type.STRING },
+                INVESTOR: { type: Type.STRING },
+                ARRANGER: { type: Type.STRING },
+              };
+            } else {
+              schemaProperties = {
+                "KEY TAKEAWAYS": { type: Type.ARRAY, items: { type: Type.STRING } },
+                "MAIN TOPIC": { type: Type.STRING },
+                "COMPANIES MENTIONED": { type: Type.ARRAY, items: { type: Type.STRING } },
+              };
             }
-          });
 
-          updates.push({
-            id: report.id,
-            structured_data: aiResponse.text
+            const prompt = `
+            Extract the following information from the article text.
+            If a field is not mentioned, leave it empty or null.
+            
+            CRITICAL FORMATTING RULES:
+            - CURRENCY: Always use standard 3-letter ISO codes (e.g., USD, EUR, GBP). Do not use symbols like $ or £.
+            - AMOUNTS (millions): If the field specifies "(millions)", output the raw number in millions (e.g., for $1.5 billion, output 1500; for $50 million, output 50).
+            - PERCENTAGES: Output as a raw number without the '%' symbol (e.g., 5.5).
+            - DATES/MONTHS: Standardize months to full names (e.g., "January", "February") and years to 4 digits (e.g., "2024").
+            - BILATERAL/SYNDICATED: Output exactly "Bilateral" or "Syndicated" if known.
+            - TEXT: Keep names and text clean, without trailing punctuation or unnecessary whitespace.
+            
+            Article Text:
+            ${report.content}
+            `;
+
+            const aiResponse = await ai.models.generateContent({
+              model: selectedModel,
+              contents: prompt,
+              config: {
+                responseMimeType: "application/json",
+                responseSchema: {
+                  type: Type.OBJECT,
+                  properties: schemaProperties
+                }
+              }
+            });
+
+            updates.push({
+              id: report.id,
+              structured_data: aiResponse.text
+            });
+            
+            // 5 second delay to stay under the 15 Requests Per Minute free tier limit
+            await new Promise(resolve => setTimeout(resolve, 5000));
+          } catch (e) {
+            console.error(`Error enriching report ${report.id}:`, e);
+            // Extra delay on error (likely rate limit)
+            await new Promise(resolve => setTimeout(resolve, 10000));
+          }
+        }
+
+        // 3. Send updates back to backend
+        if (updates.length > 0) {
+          const updateRes = await fetch('/api/reports/enrich', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ updates })
           });
+          const updateData = await updateRes.json();
           
-          // Small delay to avoid rate limits
-          await new Promise(resolve => setTimeout(resolve, 1000));
-        } catch (e) {
-          console.error(`Error enriching report ${report.id}:`, e);
+          if (updateData.success) {
+            totalProcessed += updateData.updatedCount;
+          }
         }
       }
 
-      // 4. Send updates back to backend
-      if (updates.length > 0) {
-        const updateRes = await fetch('/api/reports/enrich', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ updates })
-        });
-        const updateData = await updateRes.json();
-        
-        if (updateData.success) {
-          setScrapeResult({ success: true, message: `Successfully enriched ${updateData.updatedCount} reports.` });
+      if (!stopExtractionRef.current) {
+        if (totalProcessed > 0) {
+          setScrapeResult({ success: true, message: `Finished! Successfully extracted data for all ${totalProcessed} reports.` });
         } else {
-          setScrapeResult({ success: false, message: updateData.error || 'Failed to save enriched data' });
+          setScrapeResult({ success: true, message: 'All reports are already enriched.' });
         }
-      } else {
-        setScrapeResult({ success: false, message: 'Failed to extract data from any reports.' });
       }
     } catch (error: any) {
       setScrapeResult({ success: false, message: error.message || 'Network error' });
     } finally {
       setEnriching(false);
+      fetchReports();
     }
   };
 
@@ -251,7 +384,7 @@ export default function App() {
             </div>
             
             <form onSubmit={handleScrape} className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
                 <div>
                   <label className="block text-sm font-medium text-slate-700 mb-1">Username (Optional)</label>
                   <input 
@@ -272,6 +405,19 @@ export default function App() {
                     placeholder="••••••••"
                   />
                 </div>
+                <div>
+                  <label className="block text-sm font-medium text-slate-700 mb-1">AI Model</label>
+                  <select 
+                    value={selectedModel}
+                    onChange={(e) => setSelectedModel(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none transition-all bg-white"
+                  >
+                    <option value="gemini-3-flash-preview">Gemini 3 Flash (Default)</option>
+                    <option value="gemini-flash-latest">Gemini 1.5 Flash</option>
+                    <option value="gemini-flash-lite-latest">Gemini Flash Lite</option>
+                    <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro</option>
+                  </select>
+                </div>
               </div>
               
               <div className="flex items-center justify-between pt-2">
@@ -284,6 +430,15 @@ export default function App() {
                   )}
                 </div>
                 <div className="flex gap-2">
+                  {enriching && (
+                    <button 
+                      type="button"
+                      onClick={handleStopExtraction}
+                      className="bg-rose-100 hover:bg-rose-200 text-rose-700 px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2"
+                    >
+                      <XCircle className="w-4 h-4" /> Stop
+                    </button>
+                  )}
                   <button 
                     type="button"
                     onClick={handleEnrich}
@@ -310,11 +465,64 @@ export default function App() {
                 </div>
               </div>
             </form>
+
+            <div className="mt-8 pt-6 border-t border-slate-200">
+              <h3 className="text-sm font-semibold text-slate-900 mb-4 flex items-center gap-2">
+                <Database className="w-4 h-4 text-indigo-500" />
+                Backup & Restore
+              </h3>
+              <p className="text-xs text-slate-500 mb-4">Save your progress to a file so you can restore it later if the server resets.</p>
+              <div className="flex flex-wrap gap-3 mb-8">
+                <a
+                  href="/api/backup"
+                  download="srt_database_backup.json"
+                  className="px-4 py-2 text-sm font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors"
+                >
+                  Download Backup File
+                </a>
+                <input 
+                  type="file" 
+                  accept=".json" 
+                  ref={fileInputRef} 
+                  onChange={handleRestore} 
+                  className="hidden" 
+                />
+                <button
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={enriching || scraping || restoring}
+                  className="px-4 py-2 text-sm font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors disabled:opacity-50"
+                >
+                  {restoring ? 'Restoring...' : 'Restore from Backup'}
+                </button>
+              </div>
+
+              <h3 className="text-sm font-semibold text-slate-900 mb-4 flex items-center gap-2">
+                <Trash2 className="w-4 h-4 text-rose-500" />
+                Danger Zone
+              </h3>
+              <div className="flex flex-wrap gap-3">
+                <button
+                  onClick={handleDeleteExtracted}
+                  disabled={enriching || scraping || restoring}
+                  className="px-4 py-2 text-sm font-medium text-rose-600 bg-rose-50 hover:bg-rose-100 rounded-lg transition-colors disabled:opacity-50"
+                >
+                  Clear All Extracted Data
+                </button>
+                <button
+                  onClick={handleDeleteScraped}
+                  disabled={enriching || scraping || restoring}
+                  className="px-4 py-2 text-sm font-medium text-white bg-rose-600 hover:bg-rose-700 rounded-lg transition-colors disabled:opacity-50"
+                >
+                  Delete All Scraped Reports
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
         {/* Stats Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex items-center space-x-4">
             <div className="bg-indigo-50 p-3 rounded-xl">
               <FileText className="w-6 h-6 text-indigo-600" />
@@ -322,6 +530,22 @@ export default function App() {
             <div>
               <p className="text-sm font-medium text-slate-500">Total Reports</p>
               <p className="text-2xl font-bold text-slate-900">{stats.total}</p>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 flex items-center space-x-4">
+            <div className="bg-emerald-50 p-3 rounded-xl">
+              <Database className="w-6 h-6 text-emerald-600" />
+            </div>
+            <div className="flex-1">
+              <p className="text-sm font-medium text-slate-500">Extraction Progress</p>
+              <div className="flex items-end justify-between mb-1">
+                <p className="text-2xl font-bold text-slate-900">{stats.extractedCount} <span className="text-sm font-normal text-slate-500">/ {stats.total}</span></p>
+                <span className="text-sm font-medium text-emerald-600">{stats.total > 0 ? Math.round((stats.extractedCount / stats.total) * 100) : 0}%</span>
+              </div>
+              <div className="w-full bg-slate-100 rounded-full h-2">
+                <div className="bg-emerald-500 h-2 rounded-full transition-all duration-500" style={{ width: `${stats.total > 0 ? (stats.extractedCount / stats.total) * 100 : 0}%` }}></div>
+              </div>
             </div>
           </div>
           
@@ -381,13 +605,7 @@ export default function App() {
           ) : (
             <div className="divide-y divide-slate-100">
               {reports.map((report) => (
-                <a 
-                  key={report.id} 
-                  href={report.url.startsWith('http') ? report.url : `https://rtraintelligence.com${report.url}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="block p-6 hover:bg-slate-50 transition-colors group"
-                >
+                <div key={report.id} className="block p-6 hover:bg-slate-50 transition-colors group">
                   <div className="flex justify-between items-start gap-4">
                     <div className="flex-1">
                       <div className="flex items-center gap-3 mb-2">
@@ -397,16 +615,65 @@ export default function App() {
                         {report.date && (
                           <span className="text-xs text-slate-500">{report.date}</span>
                         )}
+                        {report.structured_data && (
+                          <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-800">
+                            Data Extracted
+                          </span>
+                        )}
                       </div>
-                      <h3 className="text-lg font-semibold text-slate-900 group-hover:text-indigo-600 transition-colors mb-2">
+                      <a 
+                        href={report.url.startsWith('http') ? report.url : `https://rtraintelligence.com${report.url}`}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-lg font-semibold text-slate-900 hover:text-indigo-600 transition-colors mb-2 block"
+                      >
                         {report.title}
-                      </h3>
+                      </a>
                       {report.summary && (
-                        <p className="text-sm text-slate-600 line-clamp-2">{report.summary}</p>
+                        <p className="text-sm text-slate-600 line-clamp-2 mb-3">{report.summary}</p>
+                      )}
+                      
+                      {report.structured_data && (
+                        <div className="mt-4">
+                          <button
+                            onClick={() => setExpandedReportId(expandedReportId === report.id ? null : report.id)}
+                            className="flex items-center gap-1 text-sm font-medium text-indigo-600 hover:text-indigo-700 transition-colors"
+                          >
+                            {expandedReportId === report.id ? (
+                              <><ChevronUp className="w-4 h-4" /> Hide Extracted Data</>
+                            ) : (
+                              <><ChevronDown className="w-4 h-4" /> View Extracted Data</>
+                            )}
+                          </button>
+                          
+                          {expandedReportId === report.id && (
+                            <div className="mt-3 p-4 bg-slate-100 rounded-xl border border-slate-200 text-sm">
+                              <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-4 gap-y-3">
+                                {Object.entries(JSON.parse(report.structured_data)).map(([key, value]) => {
+                                  if (value === null || value === '' || (Array.isArray(value) && value.length === 0)) return null;
+                                  return (
+                                    <div key={key} className="flex flex-col">
+                                      <dt className="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-1">{key}</dt>
+                                      <dd className="text-slate-900 font-mono text-xs">
+                                        {Array.isArray(value) ? (
+                                          <ul className="list-disc pl-4 space-y-1">
+                                            {value.map((item, i) => <li key={i}>{item}</li>)}
+                                          </ul>
+                                        ) : (
+                                          String(value)
+                                        )}
+                                      </dd>
+                                    </div>
+                                  );
+                                })}
+                              </dl>
+                            </div>
+                          )}
+                        </div>
                       )}
                     </div>
                   </div>
-                </a>
+                </div>
               ))}
             </div>
           )}
