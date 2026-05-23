@@ -208,7 +208,7 @@ async function startServer() {
     try {
       const reports = db.prepare('SELECT * FROM reports').all();
       res.setHeader('Content-Type', 'application/json');
-      res.setHeader('Content-Disposition', 'attachment; filename=srt_database_backup.json');
+      res.setHeader('Content-Disposition', 'attachment; filename=financial_database_backup.json');
       res.send(JSON.stringify(reports));
     } catch (error: any) {
       res.status(500).json({ error: error.message });
@@ -374,8 +374,8 @@ async function startServer() {
       }
 
       const workbook = new ExcelJS.Workbook();
-      workbook.creator = 'SRT Intelligence DB';
-      workbook.lastModifiedBy = 'SRT Intelligence DB';
+      workbook.creator = 'Financial Reports DB';
+      workbook.lastModifiedBy = 'Financial Reports DB';
       workbook.created = new Date();
 
       // Group reports by type
@@ -473,7 +473,7 @@ async function startServer() {
       }
 
       res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', 'attachment; filename="rtra-intelligence-reports.xlsx"');
+      res.setHeader('Content-Disposition', 'attachment; filename="financial-reports.xlsx"');
       
       await workbook.xlsx.write(res);
       res.end();

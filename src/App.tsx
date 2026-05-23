@@ -371,7 +371,7 @@ export default function App() {
             <div className="bg-indigo-600 p-2 rounded-lg">
               <Database className="w-5 h-5 text-white" />
             </div>
-            <h1 className="text-xl font-semibold tracking-tight text-slate-900">SRT Intelligence DB</h1>
+            <h1 className="text-xl font-semibold tracking-tight text-slate-900">Financial Reports DB</h1>
           </div>
           <div className="flex items-center space-x-2">
             <a 
@@ -501,7 +501,7 @@ export default function App() {
               <div className="flex flex-wrap gap-3 mb-8">
                 <a
                   href="/api/backup"
-                  download="srt_database_backup.json"
+                  download="financial_database_backup.json"
                   className="px-4 py-2 text-sm font-medium text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors"
                 >
                   Download Backup File
