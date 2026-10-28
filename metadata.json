@@ -1,5 +1,9 @@
 {
   "name": "Financial Reports Scraper",
   "description": "An application that scrapes and extracts structured data from financial reports.",
-  "requestFramePermissions": []
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }
+
